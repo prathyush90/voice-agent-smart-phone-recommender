@@ -5,12 +5,15 @@
     "dev": "vite"
   },
   "dependencies": {
+    "@echogarden/fvad-wasm": "^0.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "uuid":"*"
+    "uuid": "*"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
     "vite": "^5.0.0",
-    "@vitejs/plugin-react": "^4.0.0"
+    "vite-plugin-top-level-await": "^1.5.0",
+    "vite-plugin-wasm": "^3.4.1"
   }
 }

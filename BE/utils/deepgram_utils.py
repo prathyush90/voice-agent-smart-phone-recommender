@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import time
+import webrtcvad
 from websockets.legacy.client import connect
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
@@ -10,40 +11,49 @@ async def stream_to_deepgram(websocket, transcript_buffer):
     url = "wss://api.deepgram.com/v1/listen?punctuate=true"
     headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
 
+    vad = webrtcvad.Vad(3)
+    speaking = False
+    silence_sent = False
+
     async with connect(url, extra_headers=headers) as dg_ws:
-        stop_time = None
+        print("inside connect")
+        def frame_generator(chunk, frame_ms=30, sample_rate=16000):
+            frame_size = int(sample_rate * (frame_ms / 1000.0) * 2)  # 2 bytes per sample
+            for i in range(0, len(chunk), frame_size):
+                yield chunk[i:i + frame_size]
+
         async def forward_audio():
-            nonlocal stop_time
+            nonlocal speaking, silence_sent
             try:
                 while True:
                     msg = await websocket.receive()
-                    if "type" not in msg:
-                        continue
-
-                    if msg["type"] == "websocket.receive":
-                        if "bytes" in msg:
-                            await dg_ws.send(msg["bytes"])
-                            print("[DEBUG] Sent audio chunk to Deepgram")
-
-                        elif "text" in msg:
-                            try:
-                                control = json.loads(msg["text"])
-                                print("[DEBUG] Received control message:", control)
-
-                                if control.get("type") == "control" and control.get("command") == "__STOP__":
-                                    await dg_ws.send(b"")
-                                    stop_time = time.perf_counter()
-                                    print("[DEBUG] Sent STOP signal to Deepgram")
-                                    break
-                            except json.JSONDecodeError:
-                                continue
-
-                    elif msg["type"] == "websocket.disconnect":
-                        print("[DEBUG] WebSocket disconnected by client")
+                    if msg["type"] == "websocket.disconnect":
+                        print("[WS] Client disconnected.")
                         break
 
-            except RuntimeError as e:
-                print(f"[ERROR] Runtime during receive: {e}")
+                    if msg["type"] == "websocket.receive" and "bytes" in msg:
+                        audio_bytes = msg["bytes"]
+                        print("enetered message loop")
+                        has_speech = False
+                        for frame in frame_generator(audio_bytes):
+                            if len(frame) != 480:
+                                continue  # Skip invalid frame
+                            if vad.is_speech(frame, sample_rate=16000):
+                                has_speech = True
+                                break
+
+                        if has_speech:
+                            await dg_ws.send(audio_bytes)
+                            speaking = True
+                            silence_sent = False
+                            print("[VAD] 🎤 Voice detected — audio sent")
+                        elif speaking and not silence_sent:
+                            await dg_ws.send(b"")
+                            silence_sent = True
+                            speaking = False
+                            print("[VAD] 🤫 Silence — b'' sent to flush Deepgram")
+            except Exception as e:
+                print(f"[ERROR] Audio forward failed: {e}")
 
         async def receive_transcript():
             try:
@@ -56,18 +66,7 @@ async def stream_to_deepgram(websocket, transcript_buffer):
                             transcript_buffer.append(transcript)
                             print(f"[TRANSCRIPT] {transcript}")
             except Exception as e:
-                print(f"[DEBUG] Deepgram stream closed gracefully: {e}")
+                print(f"[ERROR] Deepgram closed: {e}")
 
         await asyncio.gather(forward_audio(), receive_transcript())
-
-        # Optional delay to ensure last packets are received before closing
-        # await asyncio.sleep(0.2)
-        # await dg_ws.close()
-
-    final_transcript = " ".join(transcript_buffer).strip()
-
-    if stop_time:
-        t_end = time.perf_counter()
-        print(f"[TIMER] STT-to-LLM latency: {t_end - stop_time:.2f} seconds")
-
-    return final_transcript
+        return " ".join(transcript_buffer).strip()

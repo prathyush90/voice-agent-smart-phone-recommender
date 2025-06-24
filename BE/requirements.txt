@@ -5,3 +5,6 @@ aiohttp
 redis
 openai
 python-dotenv
+requests
+websocket-client
+webrtcvad

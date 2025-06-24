@@ -1,132 +1,204 @@
-import React, { useState, useRef, useEffect } from "react";
+// src/components/VoiceChat.jsx
+import React, { useEffect, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
 
-const VoiceChat = () => {
-  const sessionId = useRef(uuidv4());
-  const [isRecording, setIsRecording] = useState(false);
-  const [isSocketReady, setIsSocketReady] = useState(false);
-  const mediaRecorderRef = useRef(null);
-  const socketRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const nextStartTimeRef = useRef(0);
-  const stopClickTimeRef = useRef(null);
-  const firstAudioChunkTimeRef = useRef(null);
+/* ────────────────── tunables ────────────────── */
+const VAD_FRAME_MS  = 100;           // analyser polling interval
+const VAD_THRESHOLD = 0.02;          // RMS above which we treat as speech
+const CHUNK_MS      = 250;           // MediaRecorder chunk size
+/* ─────────────────────────────────────────────── */
 
+export default function VoiceChat() {
+  /* durable refs ----------------------------------------------------------- */
+  const sessionId          = useRef(uuidv4());
+  const socketRef          = useRef(null);
+  const mediaRecorderRef   = useRef(null);
+  const audioCtxRef        = useRef(null);
+  const analyserRef        = useRef(null);
 
+  /* playback queue refs ---------------------------------------------------- */
+  const nextStartRef       = useRef(0);
+  const playingSrcRef      = useRef([]);          // queued AudioBufferSourceNodes
+
+  /* VAD / latency refs ----------------------------------------------------- */
+  const speakingRef        = useRef(false);       // TRUE while user is talking
+  const ttsFirstChunkRef   = useRef(null);
+  const speakStartRef      = useRef(null);
+
+  /* state for UI ----------------------------------------------------------- */
+  const [socketReady,  setSocketReady ] = useState(false);
+  const [hasStarted,   setHasStarted  ] = useState(false);
+  const [isSpeakingUI, setIsSpeakingUI] = useState(false);
+
+  /* ─────────────── open backend WS exactly once ─────────────── */
   useEffect(() => {
-    const ws = new WebSocket(`ws://localhost:8000/ws/audio?session_id=${sessionId.current}`);
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const host  =
+      location.hostname === "localhost"
+        ? "localhost:8000"
+        : location.host;                        // prod TLS (no :8000)
+    const wsURL = `${proto}://${host}/ws/audio?session_id=${sessionId.current}`;
+
+    const ws = new WebSocket(wsURL);
     ws.binaryType = "arraybuffer";
     socketRef.current = ws;
 
-    ws.onopen = () => {
-      console.log("[FE] WebSocket connected");
-      setIsSocketReady(true);
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      nextStartTimeRef.current = audioContextRef.current.currentTime;
-    };
+    ws.onopen  = () => { console.log("[FE] WS ✅ open →", wsURL); setSocketReady(true); };
+    ws.onclose = () => { console.log("[FE] WS ❌ closed");        setSocketReady(false);};
 
-    ws.onclose = () => {
-      console.log("[FE] WebSocket disconnected");
-      setIsSocketReady(false);
-    };
-
-    ws.onmessage = async (event) => {
-      if (firstAudioChunkTimeRef.current === null) {
-        firstAudioChunkTimeRef.current = performance.now();
-        console.log("first audio time init:", firstAudioChunkTimeRef.current);
-        console.log("stop  time init:", stopClickTimeRef.current);
-        const latencyMs = firstAudioChunkTimeRef.current - stopClickTimeRef.current;
-        console.log(`⏱️ TTS latency: ${latencyMs.toFixed(2)} ms`);
+    /* ----------- receive audio / __END__ from backend ---------- */
+    ws.onmessage = async (ev) => {
+      /* latency log on first audio packet in a turn */
+      if (!ttsFirstChunkRef.current) {
+        ttsFirstChunkRef.current = performance.now();
+        if (speakStartRef.current) {
+          console.log(
+            `⏱️  TTS-first-chunk latency: ${
+              (ttsFirstChunkRef.current - speakStartRef.current).toFixed(0)
+            } ms`
+          );
+        }
       }
-      if (typeof event.data === "string" && event.data === "__END__") {
-        firstAudioChunkTimeRef.current = null;
-        stopClickTimeRef.current = null;
-        console.log("[FE] Received __END__, playback done");
+
+      if (typeof ev.data === "string") {
+        if (ev.data === "__END__") {
+          console.log("[FE] <__END__> (turn finished)");
+          ttsFirstChunkRef.current = null;
+        } else {
+          console.log("[FE] text-msg:", ev.data.slice(0, 30));
+        }
         return;
       }
 
-      if (event.data instanceof ArrayBuffer) {
-        const context = audioContextRef.current;
-        if (!context) return;
+      if (!(ev.data instanceof ArrayBuffer)) return;
 
-        try {
-          const audioBuffer = await context.decodeAudioData(event.data.slice(0));
-          const source = context.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(context.destination);
+      const ctx = audioCtxRef.current;
+      try {
+        const buf = await ctx.decodeAudioData(ev.data.slice(0));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
 
-          const startAt = Math.max(context.currentTime, nextStartTimeRef.current);
-          source.start(startAt);
-          nextStartTimeRef.current = startAt + audioBuffer.duration;
+        const startAt = Math.max(ctx.currentTime, nextStartRef.current);
+        src.start(startAt);
+        nextStartRef.current = startAt + buf.duration;
+        playingSrcRef.current.push(src);
 
-          console.log(`[FE] Played chunk of ${audioBuffer.duration.toFixed(2)}s`);
-        } catch (err) {
-          console.error("[FE] Error decoding audio chunk:", err);
-        }
+        console.log(
+          `[FE] ▶ chunk ${buf.duration.toFixed(2)} s queued @ ${
+            startAt.toFixed(2)
+          }s (ctx.current=${ctx.currentTime.toFixed(2)})`
+        );
+      } catch (e) {
+        console.error("[FE] decodeAudioData error:", e);
       }
     };
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "control", command: "__DISCONNECT__" }));
-        ws.close();
-      }
-      audioContextRef.current?.close();
+      ws.close();
+      audioCtxRef.current?.close();
     };
   }, []);
 
-  const toggleRecording = async () => {
-  if (!isRecording && isSocketReady) {
-    console.log("[FE] Starting recording...");
+  /* ─────────────── voice-activity polling loop ─────────────── */
+  useEffect(() => {
+    if (!hasStarted) return;
+    const id = setInterval(() => {
+      const analyser = analyserRef.current;
+      if (!analyser) return;
 
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({
-        type: "control",
-        command: "__START__"
-      }));
-      console.log("[FE] Sent __START__ control signal");
+      const fft = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(fft);
+      const rms = Math.sqrt(fft.reduce((s, v) => s + v * v, 0) / fft.length);
+
+      const speakingNow = rms > VAD_THRESHOLD;
+
+      // debug each poll (comment out if noisy)
+      // console.log(`[VAD] rms=${rms.toFixed(4)} → ${speakingNow}`);
+
+      /* transition silence→speech */
+      if (speakingNow && !speakingRef.current) {
+        speakStartRef.current = performance.now();
+        stopCurrentTTS();
+        console.log("[VAD] 🎤 user STARTED speaking");
+      }
+      /* transition speech→silence */
+      if (!speakingNow && speakingRef.current) {
+        console.log("[VAD] 🎤 user STOPPED speaking");
+      }
+
+      speakingRef.current = speakingNow;
+      setIsSpeakingUI(speakingNow);
+    }, VAD_FRAME_MS);
+
+    return () => clearInterval(id);
+  }, [hasStarted]);
+
+  /* ───────────────────── helpers ───────────────────── */
+  const stopCurrentTTS = () => {
+    if (playingSrcRef.current.length) {
+      console.log("[FE] ⏹️  Stopping", playingSrcRef.current.length, "queued TTS sources");
     }
+    playingSrcRef.current.forEach((src) => {
+      try { src.stop(0); } catch (_) {}
+    });
+    playingSrcRef.current = [];
+    nextStartRef.current = audioCtxRef.current?.currentTime || 0;
+  };
 
+  /* ───────────── click “Start Conversation” once ───────────── */
+  const handleStart = async () => {
+    if (!socketReady || hasStarted) return;
+
+    /* open mic & VAD analyser */
+    const ctx    = new (window.AudioContext || window.webkitAudioContext)();
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream);
-    mediaRecorderRef.current = recorder;
 
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0 && socketRef.current?.readyState === WebSocket.OPEN) {
-        console.log("[FE] Sent audio chunk:", e.data.size);
+    audioCtxRef.current = ctx;
+    analyserRef.current = ctx.createAnalyser();
+    analyserRef.current.fftSize = 2048;
+    ctx.createMediaStreamSource(stream).connect(analyserRef.current);
+
+    /* MediaRecorder → send chunks whenever VAD says user is speaking */
+    const rec = new MediaRecorder(stream);
+    mediaRecorderRef.current = rec;
+
+    rec.ondataavailable = (e) => {
+      if (
+        e.data.size &&
+        speakingRef.current &&
+        socketRef.current.readyState === WebSocket.OPEN
+      ) {
+        console.log(`[FE] ⇢ send opus chunk ${e.data.size} bytes`);
         socketRef.current.send(e.data);
       }
     };
+    rec.start(CHUNK_MS);
 
-    recorder.start(250);
-    setIsRecording(true);
-  } else {
-    console.log("[FE] Stopping recording...");
-    mediaRecorderRef.current?.stop();
+    /* optional one-time hint to backend */
+    socketRef.current.send(JSON.stringify({ type: "control", command: "__START__" }));
 
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
-      
-      socketRef.current.send(JSON.stringify({
-        type: "control",
-        command: "__STOP__"
-      }));
-      console.log("[FE] Sent __STOP__ control signal");
-      stopClickTimeRef.current = performance.now();
-      console.log("Stop time init:", stopClickTimeRef.current);
-    }
+    setHasStarted(true);
+    console.log("[FE] 🎤 MediaRecorder started, chunk =", CHUNK_MS, "ms");
+  };
 
-    setIsRecording(false);
-  }
-};
-
-
+  /* ────────────────────────── UI ────────────────────────── */
   return (
-    <div className="voice-chat">
-      <button onClick={toggleRecording} disabled={!isSocketReady}>
-        {isRecording ? "Stop" : "Start"}
-      </button>
+    <div style={{ textAlign: "center", paddingTop: "2rem" }}>
+      {!hasStarted ? (
+        <button
+          onClick={handleStart}
+          disabled={!socketReady}
+          style={{ fontSize: "1.2rem", padding: "0.6rem 1.4rem" }}
+        >
+          Start&nbsp;Conversation
+        </button>
+      ) : (
+        <p style={{ fontFamily: "monospace" }}>
+          🎙️ Listening…{" "}
+          {isSpeakingUI && <span style={{ color: "orange" }}>● speaking</span>}
+        </p>
+      )}
     </div>
   );
-};
-
-export default VoiceChat;
+}
