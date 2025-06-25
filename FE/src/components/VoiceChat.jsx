@@ -46,52 +46,64 @@ export default function VoiceChat() {
       mediaRecorderRef.current?.stop();
     };
 
-    ws.onmessage = async (ev) => {
-      // latency log on first TTS chunk
-      if (!ttsFirstChunkRef.current) {
-        ttsFirstChunkRef.current = performance.now();
-        if (speakStartRef.current) {
-          console.log(
-            `⏱️ TTS-first-chunk latency: ${
-              (ttsFirstChunkRef.current - speakStartRef.current).toFixed(0)
-            } ms`
-          );
-        }
-      }
+    let decodeChain = Promise.resolve();
 
-      if (typeof ev.data === "string") {
-        if (ev.data === "__END__") {
-          console.log("[FE] <__END__> (turn finished)");
-          ttsFirstChunkRef.current = null;
-        } else {
-          console.log("[FE] text-msg:", ev.data.slice(0, 30));
-        }
-        return;
-      }
+ws.onmessage = (ev) => {
+  // latency log on first TTS chunk
+  if (!ttsFirstChunkRef.current) {
+    ttsFirstChunkRef.current = performance.now();
+    if (speakStartRef.current) {
+      console.log(
+        `⏱️ TTS-first-chunk latency: ${
+          (ttsFirstChunkRef.current - speakStartRef.current).toFixed(0)
+        } ms`
+      );
+    }
+  }
 
-      if (!(ev.data instanceof ArrayBuffer)) return;
+  // control messages
+  if (typeof ev.data === "string") {
+    if (ev.data === "__END__") {
+      console.log("[FE] <__END__> (turn finished)");
+      ttsFirstChunkRef.current = null;
+    } else {
+      console.log("[FE] text-msg:", ev.data.slice(0, 30));
+    }
+    return;
+  }
 
-      try {
-        const ctx = audioCtxRef.current;
-        const buf = await ctx.decodeAudioData(ev.data.slice(0));
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(ctx.destination);
+  // only handle ArrayBuffers
+  if (!(ev.data instanceof ArrayBuffer)) return;
 
-        const startAt = Math.max(ctx.currentTime, nextStartRef.current);
-        src.start(startAt);
-        nextStartRef.current = startAt + buf.duration;
-        playingSrcRef.current.push(src);
+  // serialize decodes via promise chain
+  const arrayBuffer = ev.data.slice(0);
+  decodeChain = decodeChain
+    .then(() =>
+      // decodeAudioData returns a Promise since recent specs
+      audioCtxRef.current.decodeAudioData(arrayBuffer)
+    )
+    .then((buf) => {
+      const ctx = audioCtxRef.current;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
 
-        console.log(
-          `[FE] ▶ chunk ${buf.duration.toFixed(2)} s queued @ ${
-            startAt.toFixed(2)
-          }s`
-        );
-      } catch (e) {
-        console.error("[FE] decodeAudioData error:", e);
-      }
-    };
+      // schedule exactly at nextStartRef
+      const startAt = Math.max(ctx.currentTime, nextStartRef.current);
+      src.start(startAt);
+      nextStartRef.current = startAt + buf.duration;
+      playingSrcRef.current.push(src);
+
+      console.log(
+        `[FE] ▶ chunk ${buf.duration.toFixed(2)} s queued @ ${
+          startAt.toFixed(2)
+        }s`
+      );
+    })
+    .catch((e) => {
+      console.error("[FE] decodeAudioData error:", e);
+    });
+};
 
     ws.onerror = (err) => {
       console.error("[FE] WS error:", err);
