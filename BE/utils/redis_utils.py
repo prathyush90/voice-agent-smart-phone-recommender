@@ -15,12 +15,14 @@ r = redis.Redis(
 )
 
 def get_session_data(session_id: str):
+    print("[Redis in GET]")
     data = r.get(session_id)
     if data:
         return json.loads(data)
     return {"summary": "", "model_id": 1}
 
 def set_session_data(session_id, summary, model_id, extra=None):
+    print("[Redis in SET]")
     doc = {"summary": summary, "model_id": model_id}
     if extra: doc.update(extra)
     r.set(session_id, json.dumps(doc))

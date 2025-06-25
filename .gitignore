@@ -1,6 +1,7 @@
 # Git ignore file 
 /FE/node_modules/
 /BE/.venv/
+/BE/ venv/
 /BE/.env
 /BE-Node/node_modules/
 /BE-Node/.env
