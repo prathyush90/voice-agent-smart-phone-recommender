@@ -9,5 +9,9 @@ export default defineConfig({
     wasm(),
     topLevelAwait(),
   ],
+  server: {
+    allowedHosts: ['.ngrok-free.app'],
+    port: 5173
+  },
   assetsInclude: ['**/*.wasm'], // ensures Vite knows to treat .wasm files correctly
 });
