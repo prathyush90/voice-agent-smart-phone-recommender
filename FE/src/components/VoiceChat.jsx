@@ -24,7 +24,7 @@ export default function VoiceChat() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const host  = location.hostname === "localhost"
       ? "localhost:8000"
-      : "https://18ac-13-220-204-79.ngrok-free.app";
+      : "18ac-13-220-204-79.ngrok-free.app";
     const wsURL = `${proto}://${host}/ws/audio?session_id=${sessionId.current}`;
 
     const ws = new WebSocket(wsURL);
